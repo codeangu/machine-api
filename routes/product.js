@@ -2,6 +2,17 @@ const express = require("express");
 const router  = express.Router();
 const Product = require("../models/Product");
 const auth    = require("../middleware/auth");
+const { isPaged, getPageParams, pagedResponse } = require("../utils/paginate");
+
+// Chota unique 4-digit product code banata hai (per user), collision par retry
+async function generateProductCode(userId) {
+  for (let i = 0; i < 15; i++) {
+    const code = String(Math.floor(1000 + Math.random() * 9000));
+    const exists = await Product.findOne({ productCode: code, user: userId });
+    if (!exists) return code;
+  }
+  return String(Date.now()).slice(-6); // fallback
+}
 
 // ── POST /api/product ─────────────────────────────────────────────────────
 router.post("/", auth, async (req, res) => {
@@ -22,14 +33,14 @@ router.post("/", auth, async (req, res) => {
 // Purana "if (body.type === 'single')" wala block hata kar yeh wala paste karein:
     
     if (body.type === "single") {
-      if (body.unitPrice == null || body.initialStock == null) {
+      if (body.unitPrice == null) {
         return res.status(400).json({
-          msg: "unitPrice and initialStock are required for single part."
+          msg: "unitPrice is required for single part."
         });
       }
 
       body.unitPrice    = Number(body.unitPrice);
-      body.initialStock = Number(body.initialStock);
+      body.initialStock = body.initialStock != null ? Number(body.initialStock) : 0;
       body.minStock     = body.minStock != null ? Number(body.minStock) : null;
 
       // ✅ YEH 2 LINES ADD KI HAIN (Zaroori hain):
@@ -83,6 +94,8 @@ router.post("/", auth, async (req, res) => {
       body.minStock     = null;
     }
 
+    body.productCode = await generateProductCode(req.user.id);
+
     const product = new Product({ ...body, user: req.user.id });
     await product.save();
 
@@ -103,7 +116,7 @@ router.post("/", auth, async (req, res) => {
 // ── GET /api/product ──────────────────────────────────────────────────────
 router.get("/", auth, async (req, res) => {
   try {
-    const { search, admin } = req.query;
+    const { search, admin, type } = req.query;
 
     // Admin: apne + baaki sab users ka data (role check)
     let userFilter = { user: req.user.id };
@@ -111,10 +124,10 @@ router.get("/", auth, async (req, res) => {
       userFilter = {};
     }
 
-    let query = { ...userFilter };
-
+    // Search filter (shared by list + counts)
+    const searchFilter = {};
     if (search) {
-      query.$or = [
+      searchFilter.$or = [
         { productName: { $regex: search, $options: "i" } },
         { model:       { $regex: search, $options: "i" } },
         { brand:       { $regex: search, $options: "i" } },
@@ -122,8 +135,27 @@ router.get("/", auth, async (req, res) => {
       ];
     }
 
-    const products = await Product.find(query).sort({ createdAt: -1 });
-    res.json(products);
+    // Full query = user + search + (optional) type
+    let query = { ...userFilter, ...searchFilter };
+    if (type === "machine" || type === "single") query.type = type;
+
+    if (!isPaged(req)) {
+      const products = await Product.find(query).sort({ createdAt: -1 });
+      return res.json(products);
+    }
+
+    // Paginated response with tab counts (counts ignore the type filter)
+    const { page, limit, skip } = getPageParams(req);
+    const countBase = { ...userFilter, ...searchFilter };
+    const [data, total, all, machine, single] = await Promise.all([
+      Product.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit),
+      Product.countDocuments(query),
+      Product.countDocuments(countBase),
+      Product.countDocuments({ ...countBase, type: "machine" }),
+      Product.countDocuments({ ...countBase, type: "single" })
+    ]);
+
+    res.json(pagedResponse(data, total, page, limit, { all, machine, single }));
   } catch (err) {
     console.error("GET /product error:", err.message);
     res.status(500).json({ msg: err.message || "Server Error: Fetch failed" });
@@ -200,6 +232,90 @@ router.get("/:id/batches", auth, async (req, res) => {
   }
 });
 
+// ── POST /api/product/:id/adjust-stock — manual stock / min-stock adjustment ─
+// Body: { currentStock?, minStock?, reason? }
+// Records an audit entry in StockLog for every change.
+router.post("/:id/adjust-stock", auth, async (req, res) => {
+  try {
+    const StockLog = require("../models/StockLog");
+    const { currentStock, minStock, reason } = req.body;
+
+    const product = await Product.findOne({ _id: req.params.id, user: req.user.id });
+    if (!product) return res.status(404).json({ msg: "Product not found" });
+
+    const logs = [];
+    const prevStock = product.currentStock || 0;
+    const prevMin = product.minStock;
+
+    // Current stock adjustment
+    if (currentStock !== undefined && currentStock !== null && currentStock !== "") {
+      const newStock = Number(currentStock);
+      if (isNaN(newStock) || newStock < 0) {
+        return res.status(400).json({ msg: "Stock quantity must be a valid number (0 or more)." });
+      }
+      if (newStock !== prevStock) {
+        product.currentStock = newStock;
+        logs.push({
+          product: product._id,
+          type: "Stock Adjustment",
+          previousStock: prevStock,
+          newStock: newStock,
+          change: newStock - prevStock,
+          previousMinStock: prevMin,
+          newMinStock: prevMin,
+          reason: reason || "Manual stock adjustment",
+          user: req.user.id
+        });
+      }
+    }
+
+    // Min-stock update
+    if (minStock !== undefined && minStock !== null && minStock !== "") {
+      const newMin = Number(minStock);
+      if (isNaN(newMin) || newMin < 0) {
+        return res.status(400).json({ msg: "Minimum stock must be a valid number (0 or more)." });
+      }
+      if (newMin !== prevMin) {
+        product.minStock = newMin;
+        logs.push({
+          product: product._id,
+          type: "Min Stock Update",
+          previousStock: product.currentStock || 0,
+          newStock: product.currentStock || 0,
+          change: 0,
+          previousMinStock: prevMin,
+          newMinStock: newMin,
+          reason: reason || "Minimum stock level updated",
+          user: req.user.id
+        });
+      }
+    }
+
+    if (logs.length === 0) {
+      return res.status(400).json({ msg: "No changes detected. Enter a new stock or minimum stock value." });
+    }
+
+    await product.save();
+    await StockLog.insertMany(logs);
+
+    res.json({ msg: "Stock updated successfully", product });
+  } catch (err) {
+    console.error("POST /product/:id/adjust-stock error:", err.message);
+    res.status(500).json({ msg: err.message || "Stock adjustment failed" });
+  }
+});
+
+// ── GET /api/product/:id/stock-logs — manual adjustment history ─────────────
+router.get("/:id/stock-logs", auth, async (req, res) => {
+  try {
+    const StockLog = require("../models/StockLog");
+    const logs = await StockLog.find({ product: req.params.id, user: req.user.id }).sort({ date: -1 }).limit(50);
+    res.json(logs);
+  } catch (err) {
+    res.status(500).json({ msg: err.message });
+  }
+});
+
 // ── GET /api/product/:id (Naya Route) ──────────────────────────────────────
 router.get("/:id", auth, async (req, res) => {
   try {
@@ -232,7 +348,7 @@ router.delete("/:id", auth, async (req, res) => {
 
     if (saleUse > 0 || purchaseUse > 0) {
       return res.status(400).json({
-        msg: "Ye product sale/purchase mein use ho chuka hai — delete nahi ho sakta."
+        msg: "This product is already used in a sale/purchase and cannot be deleted."
       });
     }
 

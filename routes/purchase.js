@@ -6,6 +6,7 @@ const Product = require("../models/Product");
 const Supplier = require("../models/supplier");
 const SupplierLedger = require("../models/SupplierLedger");
 const auth = require("../middleware/auth");
+const { isPaged, getPageParams, pagedResponse } = require("../utils/paginate");
 
 // ==========================================
 // Helper: transaction with auto-retry on transient MongoDB
@@ -44,7 +45,7 @@ async function withTxnRetry(fn, maxRetries = 4) {
 // ==========================================
 function buildItemsAndTotals(items, header) {
   if (!Array.isArray(items) || items.length === 0) {
-    throw new Error("Kam az kam ek item add karna zaroori hai");
+    throw new Error("At least one item is required");
   }
 
   let subtotal = 0;
@@ -52,11 +53,12 @@ function buildItemsAndTotals(items, header) {
   const processedItems = [];
 
   for (const item of items) {
-    if (!item.productId) throw new Error("Har item mein product select karna zaroori hai");
-    if (!item.quantity || item.quantity < 1) throw new Error("Quantity 1 se kam nahi ho sakti");
+    if (!item.productId) throw new Error("Please select a product for each item");
+    if (!item.quantity || item.quantity < 1) throw new Error("Quantity cannot be less than 1");
 
     const qty = Number(item.quantity);
     const unitCost = Number(item.unitCost) || 0;
+    const sellingPrice = Number(item.unitPriceText) || 0;
     const discount = Number(item.discount) || 0;
     const taxPct = Number(item.taxPercentage) || 0;
 
@@ -75,6 +77,7 @@ function buildItemsAndTotals(items, header) {
       serialNumber: item.serialNumber,
       quantity: qty,
       purchasePrice: unitCost,
+      sellingPrice: sellingPrice,
       taxPercentage: taxPct,
       discount: discount,
       lineTotal: lineTotal,
@@ -82,8 +85,9 @@ function buildItemsAndTotals(items, header) {
     });
   }
 
-  const grandTotal = subtotal + totalTax;
-  return { subtotal, totalTax, grandTotal, processedItems };
+  const deliveryCharges = Number(header.deliveryCharges) || 0;
+  const grandTotal = subtotal + totalTax + deliveryCharges;
+  return { subtotal, totalTax, deliveryCharges, grandTotal, processedItems };
 }
 
 // ==========================================
@@ -94,27 +98,27 @@ router.post("/", auth, async (req, res) => {
   try {
     const { header, items, amountPaid } = req.body;
 
-    if (!header || !header.supplierId) throw new Error("Supplier select karna zaroori hai");
-    if (!header.invoiceNumber) throw new Error("Invoice number zaroori hai");
+    if (!header || !header.supplierId) throw new Error("Please select a supplier");
+    if (!header.invoiceNumber) throw new Error("Invoice number is required");
 
     const newPurchaseId = await withTxnRetry(async (session) => {
       const supplierDoc = await Supplier.findOne({ _id: header.supplierId, user: req.user.id }).session(session);
-      if (!supplierDoc) throw new Error("Supplier nahi mila!");
+      if (!supplierDoc) throw new Error("Supplier not found");
 
-      // Same invoice number dobara na bane (per user)
+      // Prevent the same invoice number from being reused (per user)
       const dupe = await Purchase.findOne({ purchaseNumber: header.invoiceNumber, user: req.user.id }).session(session);
-      if (dupe) throw new Error(`Invoice #${header.invoiceNumber} pehle se mojood hai`);
+      if (dupe) throw new Error(`Invoice #${header.invoiceNumber} already exists`);
 
-      // Totals ab YAHIN calculate honge — frontend ki value sirf reference, trust nahi
-      const { subtotal, totalTax, grandTotal, processedItems } = buildItemsAndTotals(items, header);
+      // Totals are calculated here on the server — the frontend value is only a reference, not trusted
+      const { subtotal, totalTax, deliveryCharges, grandTotal, processedItems } = buildItemsAndTotals(items, header);
 
       const paid = Number(amountPaid) || 0;
-      if (paid > grandTotal) throw new Error("Amount Paid, Grand Total se zyada nahi ho sakta");
+      if (paid > grandTotal) throw new Error("Amount Paid cannot exceed Grand Total");
 
       // Stock update + product existence check
       for (const item of processedItems) {
         const productDoc = await Product.findOne({ _id: item.product, user: req.user.id }).session(session);
-        if (!productDoc) throw new Error(`Product nahi mila (ID: ${item.product})`);
+        if (!productDoc) throw new Error(`Product not found (ID: ${item.product})`);
 
         productDoc.currentStock = (productDoc.currentStock || 0) + item.quantity;
         productDoc.unitPrice = item.purchasePrice;
@@ -129,6 +133,7 @@ router.post("/", auth, async (req, res) => {
         items: processedItems,
         subTotal: subtotal,
         totalTax: totalTax,
+        deliveryCharges: deliveryCharges,
         grandTotal: grandTotal,
         amountPaid: paid,
         user: req.user.id
@@ -173,7 +178,7 @@ router.post("/", auth, async (req, res) => {
 router.get("/", auth, async (req, res) => {
   try {
     const userFilter = (req.query.admin === "true" && req.user.role === "admin") ? {} : { user: req.user.id };
-    const { from, to } = req.query;
+    const { from, to, search } = req.query;
     if (from || to) {
       userFilter.date = {};
       if (from) userFilter.date.$gte = new Date(from);
@@ -183,11 +188,43 @@ router.get("/", auth, async (req, res) => {
         userFilter.date.$lte = toDate;
       }
     }
-    const purchases = await Purchase.find(userFilter)
-      .populate("supplier", "name companyName phone")
-      .populate("items.product", "name sku type unit")
-      .sort({ date: -1 });
-    res.json(purchases);
+
+    if (search) {
+      const rx = { $regex: search, $options: "i" };
+      const supIds = await Supplier.find({ user: req.user.id, $or: [{ name: rx }, { companyName: rx }] }).distinct("_id");
+      userFilter.$or = [
+        { purchaseNumber: rx },
+        { supplier: { $in: supIds } }
+      ];
+    }
+
+    if (!isPaged(req)) {
+      const purchases = await Purchase.find(userFilter)
+        .populate("supplier", "name companyName phone")
+        .populate("items.product", "productName model brand type unitPrice barcode")
+        .sort({ date: -1 });
+      return res.json(purchases);
+    }
+
+    const { page, limit, skip } = getPageParams(req);
+    const aggMatch = { ...userFilter, user: new mongoose.Types.ObjectId(req.user.id) };
+    const [data, total, agg] = await Promise.all([
+      Purchase.find(userFilter)
+        .populate("supplier", "name companyName phone")
+        .populate("items.product", "productName model brand type unitPrice barcode")
+        .sort({ date: -1 }).skip(skip).limit(limit),
+      Purchase.countDocuments(userFilter),
+      Purchase.aggregate([
+        { $match: aggMatch },
+        { $group: { _id: null, totalPurchases: { $sum: "$grandTotal" }, totalPaid: { $sum: "$amountPaid" } } }
+      ])
+    ]);
+
+    const totalPurchases = agg[0]?.totalPurchases || 0;
+    const totalPaid = agg[0]?.totalPaid || 0;
+    res.json(pagedResponse(data, total, page, limit, {
+      totalPurchases, totalPaid, totalDue: totalPurchases - totalPaid
+    }));
   } catch (err) {
     console.error("Fetch purchases error:", err.message);
     res.status(500).json({ msg: "Server Error: Fetching purchases failed" });
@@ -199,7 +236,7 @@ router.get("/", auth, async (req, res) => {
 router.get("/supplier/:supplierId", auth, async (req, res) => {
   try {
     const purchases = await Purchase.find({ supplier: req.params.supplierId, user: req.user.id })
-      .populate("items.product", "name sku type unit")
+      .populate("items.product", "productName model brand type unitPrice barcode")
       .sort({ date: -1 });
     res.json(purchases);
   } catch (err) {
@@ -214,7 +251,7 @@ router.get("/:id", auth, async (req, res) => {
   try {
     const purchase = await Purchase.findOne({ _id: req.params.id, user: req.user.id })
       .populate("supplier", "name companyName phone address email")
-      .populate("items.product", "name sku type unit purchasePrice sellingPrice");
+      .populate("items.product", "productName model brand type unitPrice barcode");
 
     if (!purchase) {
       return res.status(404).json({ msg: "Purchase invoice not found" });
@@ -240,29 +277,29 @@ router.put("/:id", auth, async (req, res) => {
   try {
     const { header, items, amountPaid } = req.body;
 
-    if (!header || !header.supplierId) throw new Error("Supplier select karna zaroori hai");
-    if (!header.invoiceNumber) throw new Error("Invoice number zaroori hai");
+    if (!header || !header.supplierId) throw new Error("Please select a supplier");
+    if (!header.invoiceNumber) throw new Error("Invoice number is required");
 
     const oldPurchase = await Purchase.findOne({ _id: req.params.id, user: req.user.id }).session(session);
-    if (!oldPurchase) throw new Error("Purchase record nahi mila");
+    if (!oldPurchase) throw new Error("Purchase record not found");
 
     const oldSupplierDoc = await Supplier.findOne({ _id: oldPurchase.supplier, user: req.user.id }).session(session);
-    if (!oldSupplierDoc) throw new Error("Purani supplier record nahi mili");
+    if (!oldSupplierDoc) throw new Error("Previous supplier record not found");
 
-    // Invoice number kisi aur (apne ilawa) record mein duplicate na ho
+    // Ensure the invoice number is not duplicated in any other record (excluding this one)
     const dupe = await Purchase.findOne({
       purchaseNumber: header.invoiceNumber,
       user: req.user.id,
       _id: { $ne: oldPurchase._id }
     }).session(session);
-    if (dupe) throw new Error(`Invoice #${header.invoiceNumber} pehle se mojood hai`);
+    if (dupe) throw new Error(`Invoice #${header.invoiceNumber} already exists`);
 
-    // ---------- STEP 1: PURANA STOCK EFFECT REVERSE KARO ----------
+    // ---------- STEP 1: REVERSE THE OLD STOCK EFFECT ----------
     for (const oldItem of oldPurchase.items) {
       const productDoc = await Product.findOne({ _id: oldItem.product, user: req.user.id }).session(session);
       if (productDoc) {
         if ((productDoc.currentStock || 0) < oldItem.quantity) {
-          throw new Error(`"${productDoc.productName}" ka stock pehle hi sale ho chuka hai, isliye edit nahi ho sakta. Pehle related sale adjust karein.`);
+          throw new Error(`Stock for "${productDoc.productName}" has already been sold, so this purchase cannot be edited. Please adjust the related sale first.`);
         }
         productDoc.currentStock -= oldItem.quantity;
         await productDoc.save({ session });
@@ -280,18 +317,18 @@ router.put("/:id", auth, async (req, res) => {
     const newSupplierDoc = supplierChanged
       ? await Supplier.findOne({ _id: header.supplierId, user: req.user.id }).session(session)
       : oldSupplierDoc;
-    if (!newSupplierDoc) throw new Error("Nayi supplier nahi mili");
+    if (!newSupplierDoc) throw new Error("New supplier not found");
 
     // ---------- STEP 4: NAYE TOTALS CALCULATE KARO (server-side, trusted) ----------
-    const { subtotal, totalTax, grandTotal, processedItems } = buildItemsAndTotals(items, header);
+    const { subtotal, totalTax, deliveryCharges, grandTotal, processedItems } = buildItemsAndTotals(items, header);
 
     const paid = Number(amountPaid) || 0;
-    if (paid > grandTotal) throw new Error("Amount Paid, Grand Total se zyada nahi ho sakta");
+    if (paid > grandTotal) throw new Error("Amount Paid cannot exceed Grand Total");
 
     // ---------- STEP 5: NAYA STOCK EFFECT APPLY KARO ----------
     for (const item of processedItems) {
       const productDoc = await Product.findOne({ _id: item.product, user: req.user.id }).session(session);
-      if (!productDoc) throw new Error(`Product nahi mila (ID: ${item.product})`);
+      if (!productDoc) throw new Error(`Product not found (ID: ${item.product})`);
 
       productDoc.currentStock = (productDoc.currentStock || 0) + item.quantity;
       productDoc.unitPrice = item.purchasePrice;
@@ -306,6 +343,7 @@ router.put("/:id", auth, async (req, res) => {
     oldPurchase.items = processedItems;
     oldPurchase.subTotal = subtotal;
     oldPurchase.totalTax = totalTax;
+    oldPurchase.deliveryCharges = deliveryCharges;
     oldPurchase.grandTotal = grandTotal;
     oldPurchase.amountPaid = paid;
     await oldPurchase.save({ session });
@@ -328,7 +366,7 @@ router.put("/:id", auth, async (req, res) => {
     await ledger.save({ session });
 
     await session.commitTransaction();
-    res.json({ msg: "Purchase update ho gayi", id: oldPurchase._id });
+    res.json({ msg: "Purchase updated successfully", id: oldPurchase._id });
 
   } catch (err) {
     await session.abortTransaction();
@@ -362,12 +400,12 @@ router.delete("/:id", auth, async (req, res) => {
     for (const item of purchase.items) {
       const productDoc = await Product.findOne({ _id: item.product, user: req.user.id }).session(session);
       if (productDoc) {
-        // AGER STOCK SALE HO GYA HAI TO DELETE NAHI HOGA
+        // If the stock has already been sold, deletion is not allowed
         if (productDoc.currentStock < item.quantity) {
-          throw new Error(`Product "${productDoc.productName}" ka stock sale ho chuka hai. Pehle sale delete karein ya stock adjust karein.`);
+          throw new Error(`Stock for product "${productDoc.productName}" has already been sold. Please delete the sale first or adjust the stock.`);
         }
 
-        // Stock wapis kam karo
+        // Reduce the stock back
         productDoc.currentStock -= item.quantity;
         await productDoc.save({ session });
       }

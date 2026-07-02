@@ -6,6 +6,7 @@ const Product = require("../models/Product");
 const Customer = require("../models/Customer");
 const CustomerLedger = require("../models/CustomerLedger");
 const auth = require("../middleware/auth");
+const { isPaged, getPageParams, pagedResponse } = require("../utils/paginate");
 
 // ==========================================
 // Helper: run a transaction with auto-retry on transient
@@ -53,18 +54,18 @@ router.post("/", auth, async (req, res) => {
       // A. Stock Check & Update logic
       for (const item of items) {
         const product = await Product.findById(item.productId).session(session);
-        if (!product) throw new Error(`Product nahi mila: ${item.productId}`);
+        if (!product) throw new Error(`Product not found: ${item.productId}`);
 
         // ✅ Check currentStock (Jo ke asal warehouse stock hai)
         if (product.currentStock < item.quantity) {
-          throw new Error(`Stock kam hai! ${product.productName} sirf ${product.currentStock} bacha hai.`);
+          throw new Error(`Insufficient stock! Only ${product.currentStock} of ${product.productName} remaining.`);
         }
 
-        // ✅ currentStock ko minus karein (Sale par yehi variable kam hota hai)
+        // Decrease currentStock (this is the variable that reduces on a sale)
         product.currentStock -= item.quantity;
         await product.save({ session });
 
-        // Profit tracking ke liye purchasePrice item mein add kar do
+        // Store the purchase price on the item for profit tracking
         item.purchasePriceAtTime = product.unitPrice || 0;
       }
 
@@ -126,7 +127,7 @@ router.post("/", auth, async (req, res) => {
 // ==========================================
 router.get("/", auth, async (req, res) => {
   try {
-    const { from, to } = req.query;
+    const { from, to, search } = req.query;
     let filter = { user: req.user.id };
     if (from || to) {
       filter.createdAt = {};
@@ -137,11 +138,43 @@ router.get("/", auth, async (req, res) => {
         filter.createdAt.$lte = toDate;
       }
     }
-    const sales = await Sale.find(filter)
-      .populate("customer", "name phone")
-      .sort({ createdAt: -1 });
-    res.json(sales);
+
+    if (search) {
+      const rx = { $regex: search, $options: "i" };
+      // Resolve customer names to ids so name search works on registered customers too
+      const custIds = await Customer.find({ user: req.user.id, name: rx }).distinct("_id");
+      filter.$or = [
+        { invoiceNumber: rx },
+        { customerName: rx },
+        { customer: { $in: custIds } }
+      ];
+    }
+
+    if (!isPaged(req)) {
+      const sales = await Sale.find(filter)
+        .populate("customer", "name phone")
+        .sort({ createdAt: -1 });
+      return res.json(sales);
+    }
+
+    const { page, limit, skip } = getPageParams(req);
+    const aggMatch = { ...filter, user: new mongoose.Types.ObjectId(req.user.id) };
+    const [data, total, agg] = await Promise.all([
+      Sale.find(filter).populate("customer", "name phone").sort({ createdAt: -1 }).skip(skip).limit(limit),
+      Sale.countDocuments(filter),
+      Sale.aggregate([
+        { $match: aggMatch },
+        { $group: { _id: null, totalSales: { $sum: "$grandTotal" }, totalReceived: { $sum: "$amountReceived" } } }
+      ])
+    ]);
+
+    const totalSales = agg[0]?.totalSales || 0;
+    const totalReceived = agg[0]?.totalReceived || 0;
+    res.json(pagedResponse(data, total, page, limit, {
+      totalSales, totalReceived, totalDue: totalSales - totalReceived
+    }));
   } catch (err) {
+    console.error("Fetch sales error:", err.message);
     res.status(500).json({ msg: "Fetch sales error" });
   }
 });
@@ -155,7 +188,7 @@ router.get("/:id", auth, async (req, res) => {
       .populate("customer", "name phone address email")
       .populate("items.product", "productName model brand");
     
-    if (!sale) return res.status(404).json({ msg: "Invoice nahi mila" });
+    if (!sale) return res.status(404).json({ msg: "Invoice not found" });
     res.json(sale);
   } catch (err) {
     res.status(500).json({ msg: "Detail fetch error" });
@@ -245,7 +278,7 @@ router.put("/:id", auth, async (req, res) => {
 
     // 1. Purani Sale dhundein taake stock wapis sahi kiya ja sake
     const oldSale = await Sale.findById(req.params.id).session(session);
-    if (!oldSale) throw new Error("Purana record nahi mila");
+    if (!oldSale) throw new Error("Previous record not found");
 
     // 2. REVERSE OLD STOCK: Purani items ka stock wapis plus karein
     for (const oldItem of oldSale.items) {
@@ -256,13 +289,13 @@ router.put("/:id", auth, async (req, res) => {
       );
     }
 
-    // 3. APPLY NEW STOCK: Nayi items ka stock minus karein aur stock check karein
+    // 3. APPLY NEW STOCK: subtract the new items' stock and run the stock check
     for (const item of items) {
       const product = await Product.findById(item.productId).session(session);
-      if (!product) throw new Error(`Product nahi mila: ${item.productId}`);
-      
+      if (!product) throw new Error(`Product not found: ${item.productId}`);
+
       if (product.currentStock < item.quantity) {
-        throw new Error(`Stock kam hai! ${product.productName} sirf ${product.currentStock} bacha hai.`);
+        throw new Error(`Insufficient stock! Only ${product.currentStock} of ${product.productName} remaining.`);
       }
 
       product.currentStock -= item.quantity;
@@ -339,16 +372,66 @@ router.put("/:id", auth, async (req, res) => {
 });
 
 // ==========================================
-// 7. DELETE SALE (Stock + Ledger rollback)
+// 7. RECORD PAYMENT AGAINST AN EXISTING SALE (Receive Payment)
+// ==========================================
+router.post("/:id/payment", auth, async (req, res) => {
+  try {
+    const { amount, note, date } = req.body;
+    const amt = Number(amount) || 0;
+    if (amt <= 0) throw new Error("Amount must be greater than 0");
+
+    const saleId = await withTxnRetry(async (session) => {
+      const sale = await Sale.findOne({ _id: req.params.id, user: req.user.id }).session(session);
+      if (!sale) throw new Error("Sale invoice not found");
+
+      const balanceDue = sale.grandTotal - sale.amountReceived;
+      if (amt > balanceDue) throw new Error("Amount cannot exceed the balance due");
+
+      // Sale ka received amount hamesha update hota hai (walking ho ya registered)
+      sale.amountReceived += amt;
+      await sale.save({ session });
+
+      // Ledger sirf registered customer ke liye — walking customer ka koi khata nahi
+      if (sale.customer) {
+        const customer = await Customer.findOne({ _id: sale.customer, user: req.user.id }).session(session);
+        if (!customer) throw new Error("Customer not found");
+        customer.totalPaid += amt;
+        await customer.save({ session });
+
+        const ledger = new CustomerLedger({
+          customer: sale.customer,
+          transactionType: "Payment",
+          description: note || `Payment received against Invoice #${sale.invoiceNumber}`,
+          credit: amt,
+          debit: 0,
+          runningBalance: customer.balance,
+          referenceId: sale._id,
+          date: date ? new Date(date) : new Date(),
+          user: req.user.id
+        });
+        await ledger.save({ session });
+      }
+
+      return sale._id;
+    });
+
+    res.json({ msg: "Payment recorded", id: saleId });
+  } catch (err) {
+    res.status(500).json({ msg: err.message || "Payment record karne mein masla hua" });
+  }
+});
+
+// ==========================================
+// 8. DELETE SALE (Stock + Ledger rollback)
 // ==========================================
 router.delete("/:id", auth, async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
   try {
     const sale = await Sale.findOne({ _id: req.params.id, user: req.user.id }).session(session);
-    if (!sale) return res.status(404).json({ msg: "Sale invoice nahi mila" });
+    if (!sale) return res.status(404).json({ msg: "Sale invoice not found" });
 
-    // 1. Stock wapis add karein (sale reverse)
+    // 1. Add the stock back (reverse the sale)
     for (const item of sale.items) {
       await Product.findByIdAndUpdate(
         item.product,

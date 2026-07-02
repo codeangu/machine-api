@@ -1,8 +1,10 @@
 const express = require("express");
 const router = express.Router();
+const mongoose = require("mongoose");
 const Customer = require("../models/Customer");
 const CustomerLedger = require("../models/CustomerLedger");
 const auth = require("../middleware/auth");
+const { isPaged, getPageParams, pagedResponse } = require("../utils/paginate");
 
 // ==========================================
 // 1. ADD NEW CUSTOMER
@@ -47,8 +49,34 @@ router.post("/", auth, async (req, res) => {
 // ==========================================
 router.get("/", auth, async (req, res) => {
   try {
-    const customers = await Customer.find({ user: req.user.id }).sort({ createdAt: -1 });
-    res.json(customers);
+    const { search } = req.query;
+    const query = { user: req.user.id };
+    if (search) {
+      query.$or = [
+        { name:  { $regex: search, $options: "i" } },
+        { phone: { $regex: search, $options: "i" } },
+        { email: { $regex: search, $options: "i" } }
+      ];
+    }
+
+    if (!isPaged(req)) {
+      const customers = await Customer.find(query).sort({ createdAt: -1 });
+      return res.json(customers);
+    }
+
+    const { page, limit, skip } = getPageParams(req);
+    const aggMatch = { ...query, user: new mongoose.Types.ObjectId(req.user.id) };
+    const [data, total, balanceAgg] = await Promise.all([
+      Customer.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit),
+      Customer.countDocuments(query),
+      Customer.aggregate([
+        { $match: aggMatch },
+        { $group: { _id: null, totalBalance: { $sum: "$balance" } } }
+      ])
+    ]);
+
+    const totalBalance = balanceAgg[0]?.totalBalance || 0;
+    res.json(pagedResponse(data, total, page, limit, { totalBalance }));
   } catch (err) {
     res.status(500).json({ msg: err.message });
   }
@@ -60,7 +88,7 @@ router.get("/", auth, async (req, res) => {
 router.get("/:id", auth, async (req, res) => {
   try {
     const customer = await Customer.findOne({ _id: req.params.id, user: req.user.id });
-    if (!customer) return res.status(404).json({ msg: "Customer nahi mila" });
+    if (!customer) return res.status(404).json({ msg: "Customer not found" });
     res.json(customer);
   } catch (err) {
     res.status(500).json({ msg: err.message });
@@ -81,7 +109,7 @@ router.put("/:id", auth, async (req, res) => {
       { new: true }
     );
 
-    if (!updatedCustomer) return res.status(404).json({ msg: "Customer nahi mila" });
+    if (!updatedCustomer) return res.status(404).json({ msg: "Customer not found" });
     res.json(updatedCustomer);
   } catch (err) {
     res.status(500).json({ msg: err.message });
@@ -95,7 +123,7 @@ router.post("/payment", auth, async (req, res) => {
   try {
     const { customerId, amount, note, transactionType, date } = req.body;
     const customer = await Customer.findById(customerId);
-    if (!customer) return res.status(404).json({ msg: "Customer nahi mila" });
+    if (!customer) return res.status(404).json({ msg: "Customer not found" });
 
     const amt = Number(amount);
     const type = transactionType || "Payment";
@@ -133,7 +161,7 @@ router.post("/payment", auth, async (req, res) => {
 router.get("/ledger/:id", auth, async (req, res) => {
   try {
     const customer = await Customer.findById(req.params.id);
-    if (!customer) return res.status(404).json({ msg: "Customer nahi mila" });
+    if (!customer) return res.status(404).json({ msg: "Customer not found" });
 
     const rows = await CustomerLedger.find({ customer: req.params.id, user: req.user.id })
       .sort({ date: 1, _id: 1 });
@@ -170,19 +198,19 @@ router.get("/ledger/:id", auth, async (req, res) => {
 router.delete("/:id", auth, async (req, res) => {
   try {
     const customer = await Customer.findOne({ _id: req.params.id, user: req.user.id });
-    if (!customer) return res.status(404).json({ msg: "Customer nahi mila" });
+    if (!customer) return res.status(404).json({ msg: "Customer not found" });
 
     const Sale = require("../models/Sale");
     const saleCount = await Sale.countDocuments({ customer: req.params.id, user: req.user.id });
     if (saleCount > 0) {
       return res.status(400).json({
-        msg: "Is customer ki sales mojood hain — delete nahi ho sakta. Pehle related sales delete karein."
+        msg: "This customer has existing sales and cannot be deleted. Please delete the related sales first."
       });
     }
 
     await CustomerLedger.deleteMany({ customer: req.params.id, user: req.user.id });
     await customer.deleteOne();
-    res.json({ msg: "Customer delete ho gaya" });
+    res.json({ msg: "Customer deleted successfully" });
   } catch (err) {
     res.status(500).json({ msg: err.message });
   }

@@ -29,7 +29,9 @@ router.get("/summary", auth, async (req, res) => {
 
     const [todaySales, todayPurchases, allSales, allPurchases, customers, suppliers, lowStock] = await Promise.all([
       Sale.find({ user: uid, createdAt: { $gte: todayStart, $lte: todayEnd } }),
-      Purchase.find({ user: uid, date: { $gte: todayStart, $lte: todayEnd } }),
+      // createdAt use karte hain (sales ki tarah) — 'date' user-entered hoti hai jo UTC-midnight
+      // store hoti hai aur server ke local timezone "today" window se bahar gir jaati thi
+      Purchase.find({ user: uid, createdAt: { $gte: todayStart, $lte: todayEnd } }),
       Sale.find({ user: uid }),
       Purchase.find({ user: uid }),
       Customer.find({ user: uid }),
@@ -101,6 +103,29 @@ router.get("/purchases", auth, async (req, res) => {
     const totalDue       = totalPurchases - totalPaid;
 
     res.json({ purchases, totalPurchases, totalPaid, totalDue });
+  } catch (err) {
+    res.status(500).json({ msg: err.message });
+  }
+});
+
+// GET /api/reports/stock-adjustments?from=&to=
+// All manual stock / min-stock adjustments across products (audit report)
+router.get("/stock-adjustments", auth, async (req, res) => {
+  try {
+    const StockLog = require("../models/StockLog");
+    const { from, to } = req.query;
+    const df = dateFilter(from, to);
+    const filter = { user: req.user.id };
+    if (df) filter.date = df;
+
+    const logs = await StockLog.find(filter)
+      .populate("product", "productName model brand barcode")
+      .sort({ date: -1 });
+
+    const totalIncrease = logs.reduce((s, l) => s + (l.change > 0 ? l.change : 0), 0);
+    const totalDecrease = logs.reduce((s, l) => s + (l.change < 0 ? Math.abs(l.change) : 0), 0);
+
+    res.json({ logs, totalIncrease, totalDecrease, count: logs.length });
   } catch (err) {
     res.status(500).json({ msg: err.message });
   }

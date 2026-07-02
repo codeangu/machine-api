@@ -4,6 +4,7 @@ const mongoose = require("mongoose");
 const Supplier = require("../models/supplier");
 const SupplierLedger = require("../models/SupplierLedger");
 const auth = require("../middleware/auth");
+const { isPaged, getPageParams, pagedResponse } = require("../utils/paginate");
 
 // ==========================================
 // 1. BASIC CRUD (Create, Read, Update, Delete)
@@ -95,8 +96,34 @@ router.post("/", auth, async (req, res) => {
 // @desc    Saray suppliers ki list dekhna
 router.get("/", auth, async (req, res) => {
   try {
-    const suppliers = await Supplier.find({ user: req.user.id }).sort({ createdAt: -1 });
-    res.json(suppliers);
+    const { search } = req.query;
+    const query = { user: req.user.id };
+    if (search) {
+      query.$or = [
+        { name:        { $regex: search, $options: "i" } },
+        { companyName: { $regex: search, $options: "i" } },
+        { phone:       { $regex: search, $options: "i" } }
+      ];
+    }
+
+    if (!isPaged(req)) {
+      const suppliers = await Supplier.find(query).sort({ createdAt: -1 });
+      return res.json(suppliers);
+    }
+
+    const { page, limit, skip } = getPageParams(req);
+    const aggMatch = { ...query, user: new mongoose.Types.ObjectId(req.user.id) };
+    const [data, total, balanceAgg] = await Promise.all([
+      Supplier.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit),
+      Supplier.countDocuments(query),
+      Supplier.aggregate([
+        { $match: aggMatch },
+        { $group: { _id: null, totalBalance: { $sum: "$balance" } } }
+      ])
+    ]);
+
+    const totalBalance = balanceAgg[0]?.totalBalance || 0;
+    res.json(pagedResponse(data, total, page, limit, { totalBalance }));
   } catch (err) {
     console.error("Fetch suppliers error:", err.message);
     res.status(500).json({ msg: "Server Error" });

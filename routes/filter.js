@@ -7,8 +7,8 @@ const models = {
   supplier: require("../models/supplier"),
   purchase: require("../models/purchase"),
   product: require("../models/Product"),
-  customer: require("../models/Customer"), // Ensure model file exists
-  sale: require("../models/Sale"),         // Ensure model file exists
+  customer: require("../models/customer"), // Ensure model file exists
+  sale: require("../models/sale"),         // Ensure model file exists
   ledger: require("../models/SupplierLedger"),
 };
 
@@ -18,7 +18,7 @@ router.get("/:modelName", auth, async (req, res) => {
     const Model = models[modelName.toLowerCase()];
 
     if (!Model) {
-      return res.status(400).json({ msg: `Model '${modelName}' filter mein register nahi hai!` });
+      return res.status(400).json({ msg: `Model '${modelName}' is not registered in the filter!` });
     }
 
     // 2. SECURITY: User ID hamesha filter mein rahegi

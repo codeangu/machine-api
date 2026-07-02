@@ -12,6 +12,7 @@ const partItemSchema = new mongoose.Schema(
 );
 
 const productSchema = new mongoose.Schema({
+  productCode:       { type: String, default: "" }, // Chota unique code (e.g. 3722) — user ko dikhane ke liye
   productName:       { type: String, required: true },
   model:             { type: String, required: true },
   brand:             { type: String, required: true },

@@ -17,7 +17,8 @@ const purchaseItemSchema = new mongoose.Schema({
   discount: { type: Number, default: 0 },
   serialNumber: { type: String, required: true },
   quantity: { type: Number, required: true, min: 1 },
-  purchasePrice: { type: Number, required: true }, 
+  purchasePrice: { type: Number, required: true },
+  sellingPrice: { type: Number, default: 0 },
   taxPercentage: { type: Number, default: 0 },
   lineTotal: { type: Number, required: true },
   linkedParts: [nestedPartSchema] 
@@ -30,6 +31,7 @@ const purchaseSchema = new mongoose.Schema({
   items: [purchaseItemSchema],
   subTotal: { type: Number, required: true },
   totalTax: { type: Number, default: 0 },
+  deliveryCharges: { type: Number, default: 0 },
   grandTotal: { type: Number, required: true },
   amountPaid: { type: Number, default: 0 },
   paymentMethod: { type: String, default: "Cash" },

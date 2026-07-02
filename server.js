@@ -33,6 +33,8 @@ app.use("/api/product", productRoutes);
 app.use("/api/products", productRoutes); 
 app.use("/api/customer", require("./routes/customer")); 
 app.use("/api/sale", require("./routes/sale"));
+app.use("/api/sale-return", require("./routes/saleReturn"));
+app.use("/api/purchase-return", require("./routes/purchaseReturn"));
 app.use("/api/filter", require("./routes/filter"));
 app.use("/api/reports", require("./routes/reports"));
 // MongoDB Connection
