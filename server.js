@@ -19,25 +19,6 @@ app.use(cors()); // ⚠️ Public access — frontend kahin se bhi request kar s
 
 app.use(bodyParser.json());
 
-// Test Route
-app.get("/api/status", (req, res) => {
-  res.json({ status: "true" });
-});
-
-// Main Routes
-app.use("/api/auth", authRoutes);
-
-app.use("/api/supplier", require("./routes/supplier"));
-app.use("/api/purchase", require("./routes/purchase"));
-app.use("/api/product", productRoutes);
-app.use("/api/products", productRoutes); 
-app.use("/api/customer", require("./routes/customer")); 
-app.use("/api/sale", require("./routes/sale"));
-app.use("/api/sale-return", require("./routes/saleReturn"));
-app.use("/api/purchase-return", require("./routes/purchaseReturn"));
-app.use("/api/filter", require("./routes/filter"));
-app.use("/api/reports", require("./routes/reports"));
-// MongoDB Connection
 // MongoDB Connection (cached for serverless)
 let isConnected = false;
 
@@ -57,12 +38,32 @@ async function connectDB() {
 
 connectDB();
 
+// ✅ DB connection middleware — ROUTES SE PEHLE (yehi fix hai)
 app.use(async (req, res, next) => {
   if (!isConnected) {
     await connectDB();
   }
   next();
 });
+
+// Test Route
+app.get("/api/status", (req, res) => {
+  res.json({ status: "true" });
+});
+
+// Main Routes
+app.use("/api/auth", authRoutes);
+
+app.use("/api/supplier", require("./routes/supplier"));
+app.use("/api/purchase", require("./routes/purchase"));
+app.use("/api/product", productRoutes);
+app.use("/api/products", productRoutes); 
+app.use("/api/customer", require("./routes/customer")); 
+app.use("/api/sale", require("./routes/sale"));
+app.use("/api/sale-return", require("./routes/saleReturn"));
+app.use("/api/purchase-return", require("./routes/purchaseReturn"));
+app.use("/api/filter", require("./routes/filter"));
+app.use("/api/reports", require("./routes/reports"));
 
 // Local server
 if (require.main === module) {
