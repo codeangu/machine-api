@@ -1,7 +1,7 @@
 require("dotenv").config();
-// const dns = require("dns");
-// dns.setDefaultResultOrder("ipv4first");
-// dns.setServers(["8.8.8.8", "8.8.4.4"]);
+const dns = require("dns");
+dns.setDefaultResultOrder("ipv4first");
+dns.setServers(["8.8.8.8", "8.8.4.4"]);
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
@@ -18,33 +18,6 @@ const app = express();
 app.use(cors()); // ⚠️ Public access — frontend kahin se bhi request kar sakta
 
 app.use(bodyParser.json());
-
-// MongoDB Connection (cached for serverless)
-let isConnected = false;
-
-async function connectDB() {
-  if (isConnected) return;
-  try {
-    await mongoose.connect(process.env.MONGO_URI, {
-      bufferCommands: false,
-      serverSelectionTimeoutMS: 10000,
-    });
-    isConnected = true;
-    console.log("✅ MongoDB Connected...!");
-  } catch (err) {
-    console.log("❌ MongoDB Error:", err);
-  }
-}
-
-connectDB();
-
-// ✅ DB connection middleware — ROUTES SE PEHLE (yehi fix hai)
-app.use(async (req, res, next) => {
-  if (!isConnected) {
-    await connectDB();
-  }
-  next();
-});
 
 // Test Route
 app.get("/api/status", (req, res) => {
@@ -64,6 +37,32 @@ app.use("/api/sale-return", require("./routes/saleReturn"));
 app.use("/api/purchase-return", require("./routes/purchaseReturn"));
 app.use("/api/filter", require("./routes/filter"));
 app.use("/api/reports", require("./routes/reports"));
+// MongoDB Connection
+// MongoDB Connection (cached for serverless)
+let isConnected = false;
+
+async function connectDB() {
+  if (isConnected) return;
+  try {
+    await mongoose.connect(process.env.MONGO_URI, {
+      bufferCommands: false,
+      serverSelectionTimeoutMS: 10000,
+    });
+    isConnected = true;
+    console.log("✅ MongoDB Connected...!");
+  } catch (err) {
+    console.log("❌ MongoDB Error:", err);
+  }
+}
+
+connectDB();
+
+app.use(async (req, res, next) => {
+  if (!isConnected) {
+    await connectDB();
+  }
+  next();
+});
 
 // Local server
 if (require.main === module) {
