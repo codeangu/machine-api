@@ -38,9 +38,31 @@ app.use("/api/purchase-return", require("./routes/purchaseReturn"));
 app.use("/api/filter", require("./routes/filter"));
 app.use("/api/reports", require("./routes/reports"));
 // MongoDB Connection
-mongoose.connect(process.env.MONGO_URI)
-.then(() => console.log("✅ MongoDB Connected...!"))
-.catch((err) => console.log("❌ MongoDB Error:", err));
+// MongoDB Connection (cached for serverless)
+let isConnected = false;
+
+async function connectDB() {
+  if (isConnected) return;
+  try {
+    await mongoose.connect(process.env.MONGO_URI, {
+      bufferCommands: false,
+      serverSelectionTimeoutMS: 10000,
+    });
+    isConnected = true;
+    console.log("✅ MongoDB Connected...!");
+  } catch (err) {
+    console.log("❌ MongoDB Error:", err);
+  }
+}
+
+connectDB();
+
+app.use(async (req, res, next) => {
+  if (!isConnected) {
+    await connectDB();
+  }
+  next();
+});
 
 // Local server
 if (require.main === module) {
